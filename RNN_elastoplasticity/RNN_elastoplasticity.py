@@ -14,9 +14,9 @@
 # %%
 import numpy as np
 
-def interpolate(xin, yin, reverse=False):
+def interpolate(xin, yin, npt=1000, reverse=False):
 
-    strain = np.linspace(min(xin), max(xin), 1000) if not reverse else np.linspace(max(xin), min(xin), 1000)
+    strain = np.linspace(min(xin), max(xin), 1000) if not reverse else np.linspace(max(xin), min(xin), npt)
     stress = np.interp(strain, xin, yin) if not reverse else np.interp(strain, xin[::-1], yin[::-1])
 
     return strain, stress
@@ -30,16 +30,25 @@ import matplotlib.pyplot as plt
 excel_fpath = "Reproduction_Mohr_2020_JMPS.xlsx"
 sheet = 'UT w reversal'
 df = pd.read_excel(excel_fpath, sheet_name=sheet, header=9, usecols='F:P')
+E = 201000  # MPa
+sig_y = 200  # MPa
 
 df['RF2'] = df['RF2 Node 3'] + df['RF2 Node 4']
 df['U2'] = df['U2 Node 3']
 
 df['strain_true'] = np.log(1+df['U2'])
 df['stress_true'] = df['RF2'] * (1+df['U2'])
+df['strain_plastic'] = df['strain_true'] - df['stress_true'] / E
 
-ind_max = df['stress_true'].idxmax()
-strain1, stress1 = interpolate(df['strain_true'][:ind_max+1], df['stress_true'][:ind_max+1])
-strain2, stress2 = interpolate(df['strain_true'][ind_max:], df['stress_true'][ind_max:], reverse=True)
+ind_yield = df[df['stress_true']>=sig_y].index[0]
+
+df_yield = df.iloc[ind_yield:]
+ind_max = df_yield['stress_true'].idxmax()
+
+df_to_use = df_yield
+
+strain1, stress1 = interpolate(df_to_use['strain_plastic'][:ind_max+1], df_to_use['stress_true'][:ind_max+1])
+strain2, stress2 = interpolate(df_to_use['strain_plastic'][ind_max:],   df_to_use['stress_true'][ind_max:], reverse=True)
 strain = np.concatenate((strain1, strain2))
 stress = np.concatenate((stress1, stress2))
 strain_inc = np.diff(strain)
@@ -48,7 +57,7 @@ strain_sum = np.concatenate(([0], strain_sum))  # Add zero at the beginning
 print(strain_sum.shape)
 
 fig, ax = plt.subplots()
-df.plot(x='strain_true', y='stress_true', ax=ax, label='FEA')
+df_to_use.plot(x='strain_plastic', y='stress_true', ax=ax, label='FEA')
 ax.plot(strain, stress, label='Interpolated', color='r', linestyle='--')
 ax.legend()
 
@@ -70,6 +79,7 @@ class Net(nn.Module):
     def __init__(self, n_hl, n_npl):
         super(Net, self).__init__()
         self.nn_stack = nn.Sequential(
+            # nn.BatchNorm1d(2),
             nn.Linear(2, n_npl),
             nn.Tanh(),
             *[nn.Sequential(nn.Linear(n_npl, n_npl), nn.Tanh()) for _ in range(n_hl)],
@@ -77,6 +87,8 @@ class Net(nn.Module):
         )
 
     def forward(self, input):
+        # input[:,0] = (input[:,0] - np.mean(input[:,0])) / (max(input[:,0]) - min(input[:,0]))
+        # input[:,1] = (input[:,1] - np.mean(input[:,1])) / (max(input[:,1]) - min(input[:,1]))
         output = self.nn_stack(input)
         return output
 
@@ -125,7 +137,7 @@ from sklearn.model_selection import train_test_split
 model = Net(n_hl=2, n_npl=20).to(device)
 print(model)
 loss_fn = nn.MSELoss()
-optimizer = torch.optim.SGD(model.parameters(), lr=2e-5, weight_decay=3e-2)
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, weight_decay=1e-2)
 epochs = 1000
 batch_size = 40
 train_loss, test_loss = [], []
@@ -148,9 +160,38 @@ ax.set_xlabel('Epochs')
 ax.set_ylabel('Test loss [${MPa}^2$]')
 
 
+# %% [markdown]
+# Compare SS curve in FEA and ML
+
+# %%
+model.eval()
+
+strain_eval = np.vstack((strain, strain_sum)).T
+X_eval = torch.tensor(strain_eval, dtype=torch.float32)
+with torch.no_grad():
+    stress_ML = model(X_eval.to(device)).cpu().numpy()
+
+fig, axs = plt.subplots(ncols=2, figsize=(10, 5), sharey=True)
+axs[0].plot(strain, stress, label='FEA')
+axs[0].plot(strain, stress_ML, label='ML')
+axs[1].plot(strain_sum, stress, label='FEA')
+axs[1].plot(strain_sum, stress_ML, label='ML')
+
+axs[0].set_xlabel('Strain')
+axs[0].set_ylabel('Stress (MPa)')
+axs[1].set_xlabel('Accumulated strain')
+axs[0].legend(frameon=False)
+
+
 
 # %%
 torch.save(model.state_dict(), 'FCNN_J2.pth')
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'train_loss': train_loss,
+    'test_loss': test_loss,
+    }, 'FCNN_J2.tar')
 print('Saved model state to FCNN_J2.pth')
 
 # %% [markdown]
